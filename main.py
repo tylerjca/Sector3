@@ -245,6 +245,96 @@ def _load_cookies() -> list[dict]:
         return pickle.load(file_obj)
 
 
+def _select_search(driver: webdriver.Chrome) -> None:
+    """Click the Search navigation element (depends on notifications popup being dismissed)."""
+    locator_strategies = [
+        (
+            "Search link via SVG label",
+            (By.XPATH, "//a[.//svg[@aria-label='Search'] or .//title[normalize-space()='Search']]")
+        ),
+        (
+            "Search button via SVG label",
+            (By.XPATH, "//button[.//svg[@aria-label='Search'] or .//title[normalize-space()='Search']]")
+        ),
+        (
+            "Explore link fallback",
+            (By.XPATH, "//a[contains(@href, '/explore/') and (.//svg or contains(normalize-space(.), 'Search'))]")
+        ),
+        (
+            "Search text fallback",
+            (By.XPATH, "//*[self::a or self::button or @role='button'][contains(normalize-space(.), 'Search')]")
+        ),
+    ]
+
+    for strategy_name, locator in locator_strategies:
+        try:
+            search_wait = WebDriverWait(driver, 10)
+            clickable_target = search_wait.until(EC.element_to_be_clickable(locator))
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", clickable_target)
+            try:
+                clickable_target.click()
+            except (ElementClickInterceptedException, StaleElementReferenceException):
+                refreshed_target = search_wait.until(EC.presence_of_element_located(locator))
+                driver.execute_script("arguments[0].click();", refreshed_target)
+
+            print(f"Search selected via {strategy_name}.")
+            return
+        except TimeoutException:
+            continue
+
+    print("Search element not found — skipping.")
+
+
+def _select_simracing_tag(driver: webdriver.Chrome) -> None:
+    """Click the SimRacing search result after Search has been opened."""
+    locator_strategies = [
+        (
+            "Provided absolute XPath",
+            (
+                By.XPATH,
+                "//*[@id='mount_0_0_Du']/div/div/div[2]/div/div/div[1]/div[1]/div[1]/div/div/div/div/div/div/div/div[2]/div[2]/div/div/div[2]/div/div/ul/div/a/div[1]/div/div",
+            ),
+        ),
+        (
+            "Result row contains simracing",
+            (
+                By.XPATH,
+                "//a[.//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'simracing')]]",
+            ),
+        ),
+    ]
+
+    for strategy_name, locator in locator_strategies:
+        try:
+            tag_wait = WebDriverWait(driver, 12)
+            element = tag_wait.until(EC.presence_of_element_located(locator))
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+
+            try:
+                clickable_target = element.find_element(By.XPATH, "./ancestor::a[1] | ./ancestor::*[@role='button'][1]")
+            except Exception:
+                clickable_target = element
+
+            try:
+                tag_wait.until(lambda _d: clickable_target.is_displayed() and clickable_target.is_enabled())
+                clickable_target.click()
+            except Exception:
+                # Final fallback: dispatch a real mouse click event in case direct click is intercepted.
+                driver.execute_script(
+                    "arguments[0].dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));",
+                    clickable_target,
+                )
+
+            print(f"SimRacing tag selected via {strategy_name}.")
+            return
+        except TimeoutException:
+            continue
+        except StaleElementReferenceException:
+            continue
+
+    print("SimRacing tag not found or not clickable — skipping.")
+
+
 def _new_driver() -> webdriver.Chrome:
     os.environ.setdefault("SE_CACHE_PATH", str(Path(".selenium-cache").resolve()))
     options = Options()
@@ -274,7 +364,16 @@ def MANAGE_COOKIES() -> None:
     try:
         driver.get("https://instagram.com")
 
-        for cookie in _load_cookies():
+        try:
+            cookies = _load_cookies()
+        except (EOFError, pickle.UnpicklingError):
+            print("Cookie file is empty or corrupted — deleting and re-running bootstrap.")
+            COOKIE_FILE.unlink(missing_ok=True)
+            driver.quit()
+            MANAGE_COOKIES()
+            return
+
+        for cookie in cookies:
             try:
                 driver.add_cookie(_normalize_cookie(cookie))
             except Exception:
@@ -287,6 +386,8 @@ def MANAGE_COOKIES() -> None:
             raise RuntimeError("Cookie login failed: login form is still visible.")
 
         _handle_notifications_popup(driver)
+        _select_search(driver)
+        _select_simracing_tag(driver)
         _save_cookies(driver)
 
         print("Cookie session login successful.")
