@@ -1,5 +1,7 @@
 import os
 import pickle
+import random
+import sqlite3
 import time
 from pathlib import Path
 
@@ -19,6 +21,56 @@ from config import IG_PASSWORD, IG_USERNAME
 
 
 COOKIE_FILE = Path(__file__).resolve().parent / "instagram_cookies.pkl"
+DB_FILE = Path(__file__).resolve().parent / "interacted_reels.db"
+
+
+def _ensure_tracking_db() -> None:
+    if not DB_FILE.exists():
+        _initialize_tracking_db()
+
+
+def _initialize_tracking_db() -> None:
+    try:
+        with sqlite3.connect(DB_FILE) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reels (
+                    id INTEGER PRIMARY KEY,
+                    reel_url TEXT UNIQUE,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.commit()
+    except sqlite3.Error as exc:
+        print(f"Tracking DB initialization failed: {exc}")
+
+
+def is_reel_interacted(url: str) -> bool:
+    try:
+        _ensure_tracking_db()
+        with sqlite3.connect(DB_FILE, timeout=5) as connection:
+            cursor = connection.execute(
+                "SELECT 1 FROM reels WHERE reel_url = ? LIMIT 1",
+                (url,),
+            )
+            return cursor.fetchone() is not None
+    except sqlite3.Error as exc:
+        print(f"DB read failed for reel lookup: {exc}")
+        return False
+
+
+def log_interacted_reel(url: str) -> None:
+    try:
+        _ensure_tracking_db()
+        with sqlite3.connect(DB_FILE, timeout=5) as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO reels (reel_url) VALUES (?)",
+                (url,),
+            )
+            connection.commit()
+    except sqlite3.Error as exc:
+        print(f"DB write failed while logging reel URL: {exc}")
 
 
 def _click_if_present(wait: WebDriverWait, locator: tuple[str, str], label: str) -> bool:
@@ -335,6 +387,149 @@ def _select_simracing_tag(driver: webdriver.Chrome) -> None:
     print("SimRacing tag not found or not clickable — skipping.")
 
 
+def _open_new_unvisited_reel(
+    driver: webdriver.Chrome,
+    hashtag: str,
+    max_scrolls: int = 10,
+) -> bool:
+    """Backward-compatible wrapper for the new click_reel flow."""
+    return click_reel(driver, hashtag=hashtag, max_scrolls=max_scrolls)
+
+
+def _like_opened_reel(driver: webdriver.Chrome, reel_url: str) -> None:
+    """Like a Reel if the heart icon is currently not active."""
+    like_locator_strategies = [
+        (
+            "SVG aria-label Like",
+            (By.XPATH, "//svg[@aria-label='Like']/ancestor::button[1]"),
+        ),
+        (
+            "Button containing Like text",
+            (By.XPATH, "//button[.//svg[@aria-label='Like'] or contains(., 'Like')]")
+        ),
+        (
+            "Role button aria-label Like",
+            (By.CSS_SELECTOR, "button[aria-label='Like']"),
+        ),
+    ]
+
+    for strategy_name, locator in like_locator_strategies:
+        try:
+            like_wait = WebDriverWait(driver, 10)
+            like_button = like_wait.until(EC.element_to_be_clickable(locator))
+
+            aria_label = (like_button.get_attribute("aria-label") or "").strip().lower()
+            if "unlike" in aria_label or "liked" in aria_label:
+                print(f"Reel already liked, skipping duplicate like: {reel_url}")
+                return
+
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", like_button)
+            try:
+                like_button.click()
+            except (ElementClickInterceptedException, StaleElementReferenceException):
+                refreshed_like_button = like_wait.until(EC.presence_of_element_located(locator))
+                driver.execute_script("arguments[0].click();", refreshed_like_button)
+
+            print(f"Successfully liked unique Reel: {reel_url} via {strategy_name}")
+            return
+        except TimeoutException:
+            continue
+        except StaleElementReferenceException:
+            continue
+        except Exception as exc:
+            print(f"Like attempt failed for {reel_url} via {strategy_name}: {exc}")
+
+    print(f"Could not locate a safe Like button for Reel: {reel_url}")
+
+
+def click_reel(driver: webdriver.Chrome, hashtag: str = "simracing", max_scrolls: int = 10) -> bool:
+    """Find, reserve, open, and like the first unvisited Reel on the current hashtag page."""
+    db_existed_before_start = DB_FILE.exists()
+    _ensure_tracking_db()
+
+    if not db_existed_before_start:
+        print("Tracking database not found yet; opening the first available Reel on the page.")
+
+    hashtag_wait = WebDriverWait(driver, 10)
+    scroll_attempts = 0
+
+    while scroll_attempts < max_scrolls:
+        try:
+            hashtag_wait.until(
+                EC.presence_of_all_elements_located(
+                    (By.XPATH, "//a[contains(@href, '/reel/') or contains(@href, '/p/')]")
+                )
+            )
+        except TimeoutException:
+            print(f"No reel links loaded yet for #{hashtag}; attempting scroll {scroll_attempts + 1}/{max_scrolls}.")
+
+        candidates = driver.find_elements(By.XPATH, "//a[contains(@href, '/reel/') or contains(@href, '/p/')]")
+        visible_links: list[str] = []
+
+        for candidate in candidates:
+            try:
+                if not candidate.is_displayed():
+                    continue
+
+                href = (candidate.get_attribute("href") or "").strip()
+                if not href or href in visible_links:
+                    continue
+                visible_links.append(href)
+            except StaleElementReferenceException:
+                continue
+
+        if visible_links and not db_existed_before_start:
+            selected_url = visible_links[0]
+            print(f"DB missing; selecting first available Reel: {selected_url}")
+            try:
+                first_link = driver.find_element(By.XPATH, f"//a[@href='{selected_url}']")
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", first_link)
+                first_link.click()
+            except Exception:
+                driver.get(selected_url)
+
+            log_interacted_reel(selected_url)
+            time.sleep(random.uniform(1.2, 2.8))
+            _like_opened_reel(driver, selected_url)
+            return True
+
+        for href in visible_links:
+            if db_existed_before_start and is_reel_interacted(href):
+                continue
+
+            if db_existed_before_start:
+                log_interacted_reel(href)
+                print(f"Reserved new reel URL: {href}")
+            else:
+                print(f"Selected first available reel URL: {href}")
+
+            # Small randomized pause before interaction to look less robotic.
+            time.sleep(random.uniform(1.2, 2.8))
+
+            try:
+                clickable_link = driver.find_element(By.XPATH, f"//a[@href='{href}']")
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", clickable_link)
+                clickable_link.click()
+            except Exception:
+                driver.get(href)
+
+            print(f"Opened Reel from #{hashtag}: {href}")
+            _like_opened_reel(driver, href)
+            return True
+
+        scroll_attempts += 1
+        scroll_distance = random.randint(500, 900)
+        driver.execute_script(
+            "window.scrollTo({top: window.scrollY + arguments[0], behavior: 'smooth'});",
+            scroll_distance,
+        )
+        time.sleep(random.uniform(1.0, 2.2))
+        print(f"All visible reels already tracked. Scrolling ({scroll_attempts}/{max_scrolls}) for #{hashtag}.")
+
+    print(f"No new reels found for #{hashtag} after {max_scrolls} scrolls. Switching hashtag.")
+    return False
+
+
 def _new_driver() -> webdriver.Chrome:
     os.environ.setdefault("SE_CACHE_PATH", str(Path(".selenium-cache").resolve()))
     options = Options()
@@ -342,6 +537,8 @@ def _new_driver() -> webdriver.Chrome:
 
 
 def MANAGE_COOKIES() -> None:
+    _initialize_tracking_db()
+
     # Bootstrap cookie file with manual login if it does not exist yet.
     if not COOKIE_FILE.exists():
         bootstrap_driver = _new_driver()
@@ -386,8 +583,24 @@ def MANAGE_COOKIES() -> None:
             raise RuntimeError("Cookie login failed: login form is still visible.")
 
         _handle_notifications_popup(driver)
-        _select_search(driver)
-        _select_simracing_tag(driver)
+
+        hashtags_to_try = ["simracing", "simracer", "simracingcommunity"]
+        opened_new_reel = False
+        for index, hashtag in enumerate(hashtags_to_try):
+            if index == 0:
+                _select_search(driver)
+                _select_simracing_tag(driver)
+            else:
+                driver.get(f"https://www.instagram.com/explore/tags/{hashtag}/")
+                time.sleep(random.uniform(1.5, 2.5))
+
+            if click_reel(driver, hashtag=hashtag, max_scrolls=10):
+                opened_new_reel = True
+                break
+
+        if not opened_new_reel:
+            print("No brand-new reels found across configured hashtags.")
+
         _save_cookies(driver)
 
         print("Cookie session login successful.")

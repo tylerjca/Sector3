@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 .selenium-cache/
 instagram_cookies.pkl
+interacted_reels.db
